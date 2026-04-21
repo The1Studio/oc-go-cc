@@ -154,6 +154,7 @@ func (t *RequestTransformer) transformUserMessage(blocks []types.ContentBlock) (
 // transformAssistantMessage converts an assistant message with potential tool_use blocks.
 func (t *RequestTransformer) transformAssistantMessage(blocks []types.ContentBlock) ([]types.ChatMessage, error) {
 	var textParts []string
+	var thinkingParts []string
 	var toolCalls []types.ToolCall
 
 	for _, block := range blocks {
@@ -161,8 +162,11 @@ func (t *RequestTransformer) transformAssistantMessage(blocks []types.ContentBlo
 		case "text":
 			textParts = append(textParts, block.Text)
 		case "thinking":
-			// Skip thinking blocks — OpenAI doesn't have an equivalent
-			// (some models support reasoning_effort but not raw thinking blocks)
+			// Capture thinking content as reasoning_content for providers
+			// that support it (e.g. Kimi K2.5/K2.6, DeepSeek).
+			if block.Thinking != "" {
+				thinkingParts = append(thinkingParts, block.Thinking)
+			}
 		case "tool_use":
 			// Map to OpenAI function call format
 			arguments := "{}"
@@ -190,6 +194,26 @@ func (t *RequestTransformer) transformAssistantMessage(blocks []types.ContentBlo
 		Role:      "assistant",
 		Content:   content,
 		ToolCalls: toolCalls,
+	}
+
+	// Kimi K2.5/K2.6 (and similar providers) require reasoning_content in
+	// assistant messages that contain tool_calls when thinking/reasoning is
+	// enabled.  Without this field the provider returns:
+	//   "thinking is enabled but reasoning_content is missing in assistant tool call message"
+	// Set reasoning_content from captured thinking blocks, or default to empty
+	// string when tool_calls are present so the field is always serialized.
+	if len(toolCalls) > 0 {
+		reasoning := ""
+		for _, p := range thinkingParts {
+			reasoning += p
+		}
+		msg.ReasoningContent = &reasoning
+	} else if len(thinkingParts) > 0 {
+		reasoning := ""
+		for _, p := range thinkingParts {
+			reasoning += p
+		}
+		msg.ReasoningContent = &reasoning
 	}
 
 	return []types.ChatMessage{msg}, nil
