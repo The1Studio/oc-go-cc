@@ -25,6 +25,40 @@ type RouteResult struct {
 	Scenario  Scenario
 }
 
+// KnownOpenCodeGoModels lists model IDs that can be passed through directly.
+var KnownOpenCodeGoModels = map[string]bool{
+	"glm-5.1":       true,
+	"glm-5":         true,
+	"kimi-k2.6":     true,
+	"kimi-k2.5":     true,
+	"mimo-v2-pro":   true,
+	"mimo-v2-omni":  true,
+	"minimax-m2.7":  true,
+	"minimax-m2.5":  true,
+	"qwen3.6-plus":  true,
+	"qwen3.5-plus":  true,
+}
+
+// RouteWithModel determines which model to use, respecting client's model choice
+// when it matches a known OpenCode Go model (passthrough mode).
+func (r *ModelRouter) RouteWithModel(requestModel string, messages []MessageContent, tokenCount int) (RouteResult, error) {
+	// Passthrough: if the client explicitly requested a known model, use it directly
+	if requestModel != "" && KnownOpenCodeGoModels[requestModel] {
+		return RouteResult{
+			Primary: config.ModelConfig{
+				Provider:  "opencode-go",
+				ModelID:   requestModel,
+				MaxTokens: 4096,
+			},
+			Fallbacks: r.config.Fallbacks["default"],
+			Scenario:  ScenarioPassthrough,
+		}, nil
+	}
+
+	// Otherwise, use scenario-based routing
+	return r.Route(messages, tokenCount)
+}
+
 // Route determines which model to use for a request.
 func (r *ModelRouter) Route(messages []MessageContent, tokenCount int) (RouteResult, error) {
 	result := DetectScenario(messages, tokenCount, r.config)
