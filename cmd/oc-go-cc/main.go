@@ -440,6 +440,11 @@ func getDefaultConfig() string {
     "anthropic_base_url": "https://opencode.ai/zen/go/v1/messages",
     "timeout_ms": 300000
   },
+  "telemetry": {
+    "enabled": true,
+    "endpoint": "https://t1k-telemetry.tuha.workers.dev/ingest",
+    "flush_interval_sec": 60
+  },
   "logging": {
     "level": "info",
     "requests": true

@@ -16,6 +16,7 @@ import (
 	"oc-go-cc/internal/metrics"
 	"oc-go-cc/internal/middleware"
 	"oc-go-cc/internal/router"
+	"oc-go-cc/internal/telemetry"
 	"oc-go-cc/internal/token"
 	"oc-go-cc/internal/transformer"
 	"oc-go-cc/pkg/types"
@@ -36,6 +37,7 @@ type MessagesHandler struct {
 	requestDedup        *middleware.RequestDeduplicator
 	requestIDGen        *middleware.RequestIDGenerator
 	metrics             *metrics.Metrics
+	telemetryWriter     *telemetry.Writer
 }
 
 // responseWriter wraps http.ResponseWriter to track if headers were written.
@@ -73,6 +75,7 @@ func NewMessagesHandler(
 	fallbackHandler *router.FallbackHandler,
 	tokenCounter *token.Counter,
 	metrics *metrics.Metrics,
+	tw *telemetry.Writer,
 ) *MessagesHandler {
 	return &MessagesHandler{
 		config:              cfg,
@@ -88,6 +91,7 @@ func NewMessagesHandler(
 		requestDedup:        middleware.NewRequestDeduplicator(500 * time.Millisecond),
 		requestIDGen:        middleware.NewRequestIDGenerator(),
 		metrics:             metrics,
+		telemetryWriter:     tw,
 	}
 }
 
@@ -201,10 +205,10 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 
 	if isStreaming {
 		// Streaming: use ProxyStream for real-time SSE transformation
-		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody)
+		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody, routeResult)
 	} else {
 		// Non-streaming: execute with fallback and return full response
-		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody)
+		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody, routeResult)
 	}
 }
 
@@ -215,7 +219,10 @@ func (h *MessagesHandler) handleStreaming(
 	anthropicReq *types.MessageRequest,
 	modelChain []config.ModelConfig,
 	rawBody json.RawMessage,
+	routeResult router.RouteResult,
 ) {
+	startTime := time.Now()
+
 	// Each fallback attempt needs its own context with timeout.
 	// Don't share r.Context() across fallbacks - when Claude Code retries,
 	// the original context gets canceled and kills all fallbacks.
@@ -261,6 +268,9 @@ func (h *MessagesHandler) handleStreaming(
 	defer close(heartbeatDone)
 
 	streamStart := time.Now()
+	attemptCount := 0
+	var succeededModel string
+	var lastErr error
 
 	for _, model := range modelChain {
 		// Check if client already disconnected before trying this model
@@ -271,6 +281,7 @@ func (h *MessagesHandler) handleStreaming(
 		default:
 		}
 
+		attemptCount++
 		h.logger.Info("attempting streaming model", "model", model.ModelID)
 
 		// Create a fresh context with timeout for THIS attempt only.
@@ -284,6 +295,7 @@ func (h *MessagesHandler) handleStreaming(
 			modelBody := replaceModelInRawBody(rawBody, model.ModelID)
 			if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID); err != nil {
 				cancel()
+				lastErr = err
 				// Check if this was a client disconnect
 				if clientCtx.Err() == context.Canceled {
 					h.logger.Info("client disconnected during anthropic stream")
@@ -293,9 +305,13 @@ func (h *MessagesHandler) handleStreaming(
 				continue
 			}
 			cancel()
+			succeededModel = model.ModelID
 			latency := time.Since(streamStart)
 			h.metrics.RecordSuccess(model.ModelID, latency)
 			h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
+
+			// Emit telemetry event for successful streaming.
+			h.emitTelemetry(anthropicReq, routeResult, succeededModel, true, attemptCount, startTime, 0, 0, 0, 0, "")
 			return
 		}
 
@@ -303,6 +319,7 @@ func (h *MessagesHandler) handleStreaming(
 		openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
 		if err != nil {
 			cancel()
+			lastErr = err
 			h.logger.Warn("request transform failed", "model", model.ModelID, "error", err)
 			continue
 		}
@@ -311,6 +328,7 @@ func (h *MessagesHandler) handleStreaming(
 		streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq)
 		if err != nil {
 			cancel()
+			lastErr = err
 			// Check if this was a client disconnect (context canceled)
 			if clientCtx.Err() == context.Canceled {
 				h.logger.Info("client disconnected during upstream request")
@@ -320,10 +338,11 @@ func (h *MessagesHandler) handleStreaming(
 			continue
 		}
 
-		// Proxy the stream: transform OpenAI SSE → Anthropic SSE in real-time
+		// Proxy the stream: transform OpenAI SSE -> Anthropic SSE in real-time
 		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID, clientCtx); err != nil {
 			streamBody.Close()
 			cancel()
+			lastErr = err
 			if err == transformer.ErrClientDisconnected {
 				h.logger.Info("client disconnected during stream")
 				return
@@ -339,14 +358,25 @@ func (h *MessagesHandler) handleStreaming(
 
 		streamBody.Close()
 		cancel()
+		succeededModel = model.ModelID
 		latency := time.Since(streamStart)
 		h.metrics.RecordSuccess(model.ModelID, latency)
 		h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
+
+		// Emit telemetry event for successful streaming.
+		h.emitTelemetry(anthropicReq, routeResult, succeededModel, true, attemptCount, startTime, 0, 0, 0, 0, "")
 		return
 	}
 
 	// All models failed
 	h.metrics.RecordFailure()
+
+	errType := ""
+	if lastErr != nil {
+		errType = categorizeError(lastErr)
+	}
+	h.emitTelemetry(anthropicReq, routeResult, "", false, attemptCount, startTime, 0, 0, 0, 0, errType)
+
 	if !rw.wroteHeader {
 		h.sendError(w, http.StatusBadGateway, "all streaming models failed", nil)
 	} else {
@@ -463,6 +493,7 @@ func (h *MessagesHandler) handleNonStreaming(
 	anthropicReq *types.MessageRequest,
 	modelChain []config.ModelConfig,
 	rawBody json.RawMessage,
+	routeResult router.RouteResult,
 ) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -482,6 +513,10 @@ func (h *MessagesHandler) handleNonStreaming(
 
 	if err != nil {
 		h.metrics.RecordFailure()
+
+		errType := categorizeError(err)
+		h.emitTelemetry(anthropicReq, routeResult, "", false, result.Attempted, startTime, 0, 0, 0, 0, errType)
+
 		h.sendError(w, http.StatusBadGateway, "all models failed", err)
 		return
 	}
@@ -494,6 +529,18 @@ func (h *MessagesHandler) handleNonStreaming(
 		"attempts", result.Attempted,
 		"latency", latency,
 	)
+
+	// Try to extract usage from the response for telemetry.
+	inputTokens, outputTokens, cachedTokens, toolCallCount := extractUsageFromResponse(responseBody)
+
+	// Determine fallback model if there were multiple attempts.
+	fallbackModel := ""
+	if result.Attempted > 1 {
+		fallbackModel = result.ModelID
+	}
+
+	h.emitTelemetryFull(anthropicReq, routeResult, result.ModelID, true, result.Attempted,
+		startTime, inputTokens, outputTokens, cachedTokens, toolCallCount, "", fallbackModel)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -598,4 +645,147 @@ func (h *MessagesHandler) sendError(w http.ResponseWriter, statusCode int, messa
 
 	errorResp := transformer.TransformErrorResponse(statusCode, message)
 	json.NewEncoder(w).Encode(errorResp)
+}
+
+// --- Telemetry helpers ---
+
+// emitTelemetry writes a telemetry event. Fail-open: panics/errors are caught.
+func (h *MessagesHandler) emitTelemetry(
+	req *types.MessageRequest,
+	route router.RouteResult,
+	routedModel string,
+	success bool,
+	attempts int,
+	startTime time.Time,
+	inputTokens, outputTokens, cachedTokens, toolCallCount int,
+	errorType string,
+) {
+	h.emitTelemetryFull(req, route, routedModel, success, attempts, startTime,
+		inputTokens, outputTokens, cachedTokens, toolCallCount, errorType, "")
+}
+
+// emitTelemetryFull writes a telemetry event with all fields including fallback model.
+func (h *MessagesHandler) emitTelemetryFull(
+	req *types.MessageRequest,
+	route router.RouteResult,
+	routedModel string,
+	success bool,
+	attempts int,
+	startTime time.Time,
+	inputTokens, outputTokens, cachedTokens, toolCallCount int,
+	errorType string,
+	fallbackModel string,
+) {
+	if h.telemetryWriter == nil {
+		return
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			h.logger.Warn("telemetry emit panic recovered", "error", r)
+		}
+	}()
+
+	isStreaming := req.Stream != nil && *req.Stream
+	if routedModel == "" {
+		routedModel = route.Primary.ModelID
+	}
+
+	ev := telemetry.Event{
+		RequestModel:     req.Model,
+		RoutedModel:      routedModel,
+		Scenario:         string(route.Scenario),
+		Streaming:        isStreaming,
+		MessageCount:     len(req.Messages),
+		ToolDefCount:     len(req.Tools),
+		InputTokens:      inputTokens,
+		OutputTokens:     outputTokens,
+		CachedTokens:     cachedTokens,
+		LatencyMs:        time.Since(startTime).Milliseconds(),
+		Success:          success,
+		FallbackAttempts: attempts,
+		FallbackModel:    fallbackModel,
+		ErrorType:        errorType,
+		ToolCallCount:    toolCallCount,
+	}
+
+	h.telemetryWriter.WriteEvent(ev)
+}
+
+// extractUsageFromResponse tries to extract token usage from a JSON response body.
+// It checks both Anthropic and OpenAI response formats. Returns zeros on failure.
+func extractUsageFromResponse(body []byte) (inputTokens, outputTokens, cachedTokens, toolCallCount int) {
+	// Try Anthropic format first.
+	var anthropicResp struct {
+		Usage struct {
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
+		Content []struct {
+			Type string `json:"type"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(body, &anthropicResp); err == nil && anthropicResp.Usage.InputTokens > 0 {
+		inputTokens = anthropicResp.Usage.InputTokens
+		outputTokens = anthropicResp.Usage.OutputTokens
+		cachedTokens = anthropicResp.Usage.CacheReadInputTokens + anthropicResp.Usage.CacheCreationInputTokens
+		for _, c := range anthropicResp.Content {
+			if c.Type == "tool_use" {
+				toolCallCount++
+			}
+		}
+		return
+	}
+
+	// Try OpenAI format.
+	var openaiResp struct {
+		Usage struct {
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct{} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &openaiResp); err == nil && openaiResp.Usage.PromptTokens > 0 {
+		inputTokens = openaiResp.Usage.PromptTokens
+		outputTokens = openaiResp.Usage.CompletionTokens
+		if openaiResp.Usage.PromptTokensDetails != nil {
+			cachedTokens = openaiResp.Usage.PromptTokensDetails.CachedTokens
+		}
+		if len(openaiResp.Choices) > 0 {
+			toolCallCount = len(openaiResp.Choices[0].Message.ToolCalls)
+		}
+	}
+
+	return
+}
+
+// categorizeError returns a short error type string for telemetry.
+func categorizeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "timeout") || strings.Contains(s, "deadline"):
+		return "timeout"
+	case strings.Contains(s, "connection refused") || strings.Contains(s, "connection reset"):
+		return "connection"
+	case strings.Contains(s, "429") || strings.Contains(s, "rate limit"):
+		return "rate_limit"
+	case strings.Contains(s, "500") || strings.Contains(s, "502") || strings.Contains(s, "503"):
+		return "server_error"
+	case strings.Contains(s, "context canceled"):
+		return "client_disconnect"
+	default:
+		return "unknown"
+	}
 }

@@ -134,6 +134,17 @@ func applyDefaults(cfg *Config) {
 	if cfg.OpenCodeGo.TimeoutMs == 0 {
 		cfg.OpenCodeGo.TimeoutMs = defaultTimeoutMs
 	}
+	// Telemetry defaults.
+	if !cfg.Telemetry.Enabled && cfg.Telemetry.Endpoint == "" {
+		cfg.Telemetry.Enabled = true
+	}
+	if cfg.Telemetry.Endpoint == "" {
+		cfg.Telemetry.Endpoint = "https://t1k-telemetry.tuha.workers.dev/ingest"
+	}
+	if cfg.Telemetry.FlushIntervalSec == 0 {
+		cfg.Telemetry.FlushIntervalSec = 60
+	}
+
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = defaultLogLevel
 	}

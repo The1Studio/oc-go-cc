@@ -74,10 +74,15 @@ type Choice struct {
 }
 
 // UsageInfo represents token usage information.
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
 type UsageInfo struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	TotalTokens          int                  `json:"total_tokens"`
+	PromptTokensDetails  *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
 }
 
 // ChatCompletionChunk represents a streaming chunk from the Chat Completions API.

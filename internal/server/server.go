@@ -16,14 +16,16 @@ import (
 	"oc-go-cc/internal/handlers"
 	"oc-go-cc/internal/metrics"
 	"oc-go-cc/internal/router"
+	"oc-go-cc/internal/telemetry"
 	"oc-go-cc/internal/token"
 )
 
 // Server represents the proxy server.
 type Server struct {
-	config  *config.Config
-	httpSrv *http.Server
-	logger  *slog.Logger
+	config    *config.Config
+	httpSrv   *http.Server
+	logger    *slog.Logger
+	telemetry *telemetry.Writer
 }
 
 // NewServer creates a new proxy server.
@@ -42,6 +44,9 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	// Create metrics
 	metrics := metrics.New()
 
+	// Create telemetry writer.
+	tw := telemetry.New(logger)
+
 	openCodeClient := client.NewOpenCodeClient(cfg.OpenCodeGo, cfg.APIKey)
 	modelRouter := router.NewModelRouter(cfg)
 	fallbackHandler := router.NewFallbackHandler(logger, 3, 30*time.Second)
@@ -54,6 +59,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		fallbackHandler,
 		tokenCounter,
 		metrics,
+		tw,
 	)
 	healthHandler := handlers.NewHealthHandler(tokenCounter, fallbackHandler, metrics)
 
@@ -76,9 +82,10 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	}
 
 	return &Server{
-		config:  cfg,
-		httpSrv: httpSrv,
-		logger:  logger,
+		config:    cfg,
+		httpSrv:   httpSrv,
+		logger:    logger,
+		telemetry: tw,
 	}, nil
 }
 
@@ -90,6 +97,20 @@ func (s *Server) Start() error {
 		"base_url", s.config.OpenCodeGo.BaseURL,
 	)
 
+	// Telemetry: flush any pending events from a previous crash.
+	if s.config.Telemetry.Enabled {
+		s.telemetry.FlushPending()
+		s.telemetry.StartFlusher(
+			s.config.Telemetry.Endpoint,
+			s.config.Telemetry.FlushIntervalSec,
+			telemetry.GHToken,
+		)
+		s.logger.Info("telemetry enabled",
+			"endpoint", s.config.Telemetry.Endpoint,
+			"flush_interval_sec", s.config.Telemetry.FlushIntervalSec,
+		)
+	}
+
 	// Graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -97,6 +118,12 @@ func (s *Server) Start() error {
 	go func() {
 		<-ctx.Done()
 		s.logger.Info("shutting down server...")
+
+		// Flush telemetry before stopping.
+		if s.config.Telemetry.Enabled {
+			s.logger.Info("flushing telemetry...")
+			s.telemetry.Flush()
+		}
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

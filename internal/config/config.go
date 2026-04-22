@@ -10,6 +10,7 @@ type Config struct {
 	Fallbacks  map[string][]ModelConfig `json:"fallbacks"`
 	OpenCodeGo OpenCodeGoConfig         `json:"opencode_go"`
 	Logging    LoggingConfig            `json:"logging"`
+	Telemetry  TelemetryConfig          `json:"telemetry"`
 }
 
 // ModelConfig defines routing rules for a specific model.
@@ -32,4 +33,11 @@ type OpenCodeGoConfig struct {
 type LoggingConfig struct {
 	Level    string `json:"level"`
 	Requests bool   `json:"requests"`
+}
+
+// TelemetryConfig controls WAL telemetry behavior.
+type TelemetryConfig struct {
+	Enabled          bool   `json:"enabled"`
+	Endpoint         string `json:"endpoint"`
+	FlushIntervalSec int    `json:"flush_interval_sec"`
 }
