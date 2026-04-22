@@ -603,6 +603,11 @@ func (h *MessagesHandler) executeOpenAIRequest(
 		return nil, fmt.Errorf("response transform failed: %w", err)
 	}
 
+	// Inject cached_tokens from OpenAI response into Anthropic usage for telemetry.
+	if resp.Usage.PromptTokensDetails != nil && resp.Usage.PromptTokensDetails.CachedTokens > 0 {
+		anthropicResp.Usage.CacheReadInputTokens = resp.Usage.PromptTokensDetails.CachedTokens
+	}
+
 	return json.Marshal(anthropicResp)
 }
 
