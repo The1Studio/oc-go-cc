@@ -177,13 +177,14 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Route to appropriate model.
+	// If the client requested a specific known model, use it directly (passthrough).
+	// Otherwise, use scenario-based routing.
 	var routeResult router.RouteResult
 	if isStreaming && !h.modelRouter.IsStreamingScenarioRoutingEnabled() {
-		// Streaming: use faster models to minimize TTFT (time-to-first-token)
-		routeResult = h.modelRouter.RouteForStreaming(routerMessages, tokenCount)
+		routeResult = h.modelRouter.RouteWithModelForStreaming(anthropicReq.Model, routerMessages, tokenCount)
 	} else {
 		var err error
-		routeResult, err = h.modelRouter.Route(routerMessages, tokenCount)
+		routeResult, err = h.modelRouter.RouteWithModel(anthropicReq.Model, routerMessages, tokenCount)
 		if err != nil {
 			h.sendError(w, http.StatusInternalServerError, "routing failed", err)
 			return

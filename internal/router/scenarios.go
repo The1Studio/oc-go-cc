@@ -230,3 +230,6 @@ func RouteForStreaming(messages []MessageContent, tokenCount int, cfg *config.Co
 		Reason:     "streaming request - use fast model (qwen3.6-plus)",
 	}
 }
+
+// ScenarioPassthrough is used when the client explicitly requests a known model.
+const ScenarioPassthrough Scenario = "passthrough"
