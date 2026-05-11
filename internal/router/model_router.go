@@ -102,16 +102,16 @@ func (r *ModelRouter) RouteForStreaming(messages []MessageContent, tokenCount in
 // When a client requests one of these, the proxy uses it as-is instead of
 // scenario-based routing. This enables per-subagent model selection.
 var KnownOpenCodeGoModels = map[string]bool{
-	"glm-5.1":       true,
-	"glm-5":         true,
-	"kimi-k2.6":     true,
-	"kimi-k2.5":     true,
-	"mimo-v2-pro":   true,
-	"mimo-v2-omni":  true,
-	"qwen3.6-plus":  true,
-	"qwen3.5-plus":  true,
-	"minimax-m2.7":  true,
-	"minimax-m2.5":  true,
+	"glm-5.1":      true,
+	"glm-5":        true,
+	"kimi-k2.6":    true,
+	"kimi-k2.5":    true,
+	"mimo-v2-pro":  true,
+	"mimo-v2-omni": true,
+	"qwen3.6-plus": true,
+	"qwen3.5-plus": true,
+	"minimax-m2.7": true,
+	"minimax-m2.5": true,
 }
 
 // RouteWithModel determines which model to use, respecting the client's model
