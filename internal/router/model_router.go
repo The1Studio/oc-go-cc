@@ -112,6 +112,8 @@ var KnownOpenCodeGoModels = map[string]bool{
 	"qwen3.5-plus": true,
 	"minimax-m2.7": true,
 	"minimax-m2.5": true,
+	"deepseek-v4-pro":   true,
+	"deepseek-v4-flash": true,
 }
 
 // RouteWithModel determines which model to use, respecting the client's model
