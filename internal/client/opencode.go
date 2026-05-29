@@ -205,8 +205,16 @@ func (c *OpenCodeClient) doRequest(
 
 	if resp.StatusCode >= http.StatusBadRequest {
 		bodyBytes, _ := io.ReadAll(resp.Body)
+		retryAfter := resp.Header.Get("Retry-After")
 		_ = resp.Body.Close()
-		return nil, resp.StatusCode, fmt.Errorf("API error %d: %s", resp.StatusCode, string(bodyBytes))
+		// Structured error so the fallback loop + handler can propagate
+		// quota-exhaustion (429 + Retry-After) instead of flattening it
+		// into a generic 502. See pkg/types.UpstreamError.
+		return nil, resp.StatusCode, &types.UpstreamError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: retryAfter,
+			Body:       string(bodyBytes),
+		}
 	}
 
 	return resp, resp.StatusCode, nil
