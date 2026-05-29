@@ -104,6 +104,15 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("OC_GO_CC_API_KEY"); v != "" {
 		cfg.APIKey = v
 	}
+	if v := os.Getenv("OC_GO_CC_API_KEYS"); v != "" {
+		parts := strings.Split(v, ",")
+		cfg.APIKeys = cfg.APIKeys[:0]
+		for _, p := range parts {
+			if trimmed := strings.TrimSpace(p); trimmed != "" {
+				cfg.APIKeys = append(cfg.APIKeys, trimmed)
+			}
+		}
+	}
 	if v := os.Getenv("OC_GO_CC_HOST"); v != "" {
 		cfg.Host = v
 	}
@@ -122,6 +131,17 @@ func applyEnvOverrides(cfg *Config) {
 
 // applyDefaults fills in missing configuration values with sensible defaults.
 func applyDefaults(cfg *Config) {
+	// Normalize api_key / api_keys: callers should read APIKeys.
+	// If api_keys is empty but api_key is set, promote it to a single-element
+	// slice so the rest of the code only needs to read APIKeys.
+	if len(cfg.APIKeys) == 0 && cfg.APIKey != "" {
+		cfg.APIKeys = []string{cfg.APIKey}
+	}
+	// If api_keys is set but api_key is not, mirror the first one into APIKey
+	// to keep existing single-key callers (tests, status printer) working.
+	if cfg.APIKey == "" && len(cfg.APIKeys) > 0 {
+		cfg.APIKey = cfg.APIKeys[0]
+	}
 	if cfg.Host == "" {
 		cfg.Host = defaultHost
 	}
@@ -144,8 +164,8 @@ func applyDefaults(cfg *Config) {
 
 // validate checks that all required configuration fields are present.
 func validate(cfg *Config) error {
-	if cfg.APIKey == "" {
-		return fmt.Errorf("api_key is required (set via config file or OC_GO_CC_API_KEY env var)")
+	if cfg.APIKey == "" && len(cfg.APIKeys) == 0 {
+		return fmt.Errorf("api_key (or api_keys) is required (set via config file or OC_GO_CC_API_KEY / OC_GO_CC_API_KEYS env var)")
 	}
 	return nil
 }
