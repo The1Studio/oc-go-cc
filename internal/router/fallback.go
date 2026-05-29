@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"oc-go-cc/internal/config"
+	"oc-go-cc/pkg/types"
 )
 
 // CircuitState represents the state of a circuit breaker.
@@ -174,6 +175,12 @@ func (h *FallbackHandler) ExecuteWithFallback(
 ) (*FallbackResult, []byte, error) {
 	totalModels := len(models)
 
+	// Track errors so the terminal failure carries a meaningful status.
+	// A rate-limit (429 + Retry-After) is preserved preferentially so the
+	// handler can propagate quota-exhaustion instead of a generic 502.
+	var lastErr error
+	var rateLimitErr error
+
 	for i, model := range models {
 		cb := h.getCircuitBreaker(model.ModelID)
 
@@ -208,6 +215,11 @@ func (h *FallbackHandler) ExecuteWithFallback(
 			}, body, nil
 		}
 
+		lastErr = err
+		if rateLimitErr == nil && types.IsRateLimited(err) {
+			rateLimitErr = err
+		}
+
 		cb.RecordFailure()
 		h.logger.Warn("model failed, trying fallback",
 			"model", model.ModelID,
@@ -217,12 +229,23 @@ func (h *FallbackHandler) ExecuteWithFallback(
 		)
 	}
 
+	// Prefer surfacing a 429 (with its Retry-After) over a generic failure
+	// so the caller knows it was quota, not an outage. Falls back to the
+	// last error, then a generic message if every model was circuit-skipped.
+	terminalErr := rateLimitErr
+	if terminalErr == nil {
+		terminalErr = lastErr
+	}
+	if terminalErr == nil {
+		terminalErr = fmt.Errorf("all models failed (%d attempts)", totalModels)
+	}
+
 	return &FallbackResult{
 		ModelID:     models[0].ModelID,
 		Success:     false,
 		Attempted:   totalModels,
 		TotalModels: totalModels,
-	}, nil, fmt.Errorf("all models failed (%d attempts)", totalModels)
+	}, nil, terminalErr
 }
 
 // GetFallbackChain returns the fallback chain for a given primary model.

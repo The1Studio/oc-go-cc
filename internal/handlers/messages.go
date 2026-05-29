@@ -263,6 +263,17 @@ func (h *MessagesHandler) handleStreaming(
 
 	streamStart := time.Now()
 
+	// Track the terminal upstream error so a 429 (quota) can be propagated
+	// with its Retry-After even in the streaming path. Prefer a rate-limit
+	// error over a generic one.
+	var lastStreamErr, rateLimitStreamErr error
+	noteStreamErr := func(err error) {
+		lastStreamErr = err
+		if rateLimitStreamErr == nil && types.IsRateLimited(err) {
+			rateLimitStreamErr = err
+		}
+	}
+
 	for _, model := range modelChain {
 		// Check if client already disconnected before trying this model
 		select {
@@ -291,6 +302,7 @@ func (h *MessagesHandler) handleStreaming(
 					return
 				}
 				h.logger.Warn("anthropic streaming failed", "model", model.ModelID, "error", err)
+				noteStreamErr(err)
 				continue
 			}
 			cancel()
@@ -318,6 +330,7 @@ func (h *MessagesHandler) handleStreaming(
 				return
 			}
 			h.logger.Warn("streaming request failed", "model", model.ModelID, "error", err)
+			noteStreamErr(err)
 			continue
 		}
 
@@ -348,11 +361,20 @@ func (h *MessagesHandler) handleStreaming(
 
 	// All models failed
 	h.metrics.RecordFailure()
+	terminalErr := rateLimitStreamErr
+	if terminalErr == nil {
+		terminalErr = lastStreamErr
+	}
 	if !rw.wroteHeader {
-		h.sendError(w, http.StatusBadGateway, "all streaming models failed", nil)
+		// Headers not sent yet — propagate 429 + Retry-After (quota) or 502.
+		h.sendUpstreamError(w, terminalErr)
 	} else {
-		// Headers already sent - send error as SSE event
-		h.sendStreamError(rw, "all upstream models failed")
+		// Headers already sent — can only signal via an SSE error event.
+		msg := "all upstream models failed"
+		if types.IsRateLimited(terminalErr) {
+			msg = "upstream rate limit (quota) exhausted"
+		}
+		h.sendStreamError(rw, msg)
 	}
 }
 
@@ -466,7 +488,7 @@ func (h *MessagesHandler) handleNonStreaming(
 
 	if err != nil {
 		h.metrics.RecordFailure()
-		h.sendError(w, http.StatusBadGateway, "all models failed", err)
+		h.sendUpstreamError(w, err)
 		return
 	}
 
@@ -553,6 +575,24 @@ func extractTextFromBlocks(blocks []types.ContentBlock) string {
 		}
 	}
 	return content
+}
+
+// sendUpstreamError maps a terminal fallback error to a client response,
+// preserving quota-exhaustion semantics. When the error is a 429 (with an
+// optional Retry-After), it is propagated as 429 + Retry-After so callers
+// (e.g. the model-router failover layer) can distinguish "out of quota,
+// resets at T" from a generic upstream outage. Everything else stays 502.
+func (h *MessagesHandler) sendUpstreamError(w http.ResponseWriter, err error) {
+	if ue, ok := types.AsUpstreamError(err); ok && ue.StatusCode == http.StatusTooManyRequests {
+		if ue.RetryAfter != "" {
+			if rw, ok := w.(*responseWriter); !ok || !rw.wroteHeader {
+				w.Header().Set("Retry-After", ue.RetryAfter)
+			}
+		}
+		h.sendError(w, http.StatusTooManyRequests, "upstream rate limit (quota) exhausted", err)
+		return
+	}
+	h.sendError(w, http.StatusBadGateway, "all models failed", err)
 }
 
 // sendError sends an error response in Anthropic format.
