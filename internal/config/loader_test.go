@@ -181,6 +181,123 @@ func TestInterpolateEnvVars(t *testing.T) {
 	}
 }
 
+func TestAPIKeysFromFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	cfgJSON := `{"api_keys": ["alpha", "bravo", "charlie"]}`
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+	defer func() { _ = os.Unsetenv("OC_GO_CC_CONFIG") }()
+
+	oldAPIKey := os.Getenv("OC_GO_CC_API_KEY")
+	_ = os.Unsetenv("OC_GO_CC_API_KEY")
+	defer func() { _ = os.Setenv("OC_GO_CC_API_KEY", oldAPIKey) }()
+	oldAPIKeys := os.Getenv("OC_GO_CC_API_KEYS")
+	_ = os.Unsetenv("OC_GO_CC_API_KEYS")
+	defer func() { _ = os.Setenv("OC_GO_CC_API_KEYS", oldAPIKeys) }()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if len(cfg.APIKeys) != 3 {
+		t.Fatalf("APIKeys len = %d, want 3", len(cfg.APIKeys))
+	}
+	if cfg.APIKeys[0] != "alpha" || cfg.APIKeys[1] != "bravo" || cfg.APIKeys[2] != "charlie" {
+		t.Errorf("APIKeys = %v, want [alpha bravo charlie]", cfg.APIKeys)
+	}
+	// applyDefaults must mirror APIKeys[0] into APIKey for legacy callers.
+	if cfg.APIKey != "alpha" {
+		t.Errorf("APIKey mirror = %q, want %q", cfg.APIKey, "alpha")
+	}
+}
+
+func TestAPIKeyPromotedIntoAPIKeysWhenAPIKeysAbsent(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	cfgJSON := `{"api_key": "single"}`
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+	defer func() { _ = os.Unsetenv("OC_GO_CC_CONFIG") }()
+
+	oldAPIKey := os.Getenv("OC_GO_CC_API_KEY")
+	_ = os.Unsetenv("OC_GO_CC_API_KEY")
+	defer func() { _ = os.Setenv("OC_GO_CC_API_KEY", oldAPIKey) }()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if len(cfg.APIKeys) != 1 || cfg.APIKeys[0] != "single" {
+		t.Errorf("APIKeys = %v, want [single]", cfg.APIKeys)
+	}
+}
+
+func TestEnvOverrideAPIKeysCommaSeparated(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	cfgJSON := `{"api_key": "file-key"}`
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+	_ = os.Setenv("OC_GO_CC_API_KEYS", "k1, k2 ,k3,")
+	defer func() {
+		_ = os.Unsetenv("OC_GO_CC_CONFIG")
+		_ = os.Unsetenv("OC_GO_CC_API_KEYS")
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if len(cfg.APIKeys) != 3 {
+		t.Fatalf("APIKeys len = %d, want 3 (trailing comma + spaces should be trimmed)", len(cfg.APIKeys))
+	}
+	for i, want := range []string{"k1", "k2", "k3"} {
+		if cfg.APIKeys[i] != want {
+			t.Errorf("APIKeys[%d] = %q, want %q", i, cfg.APIKeys[i], want)
+		}
+	}
+}
+
+func TestLoadMissingAPIKeyAndAPIKeys(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	cfgJSON := `{"host": "127.0.0.1"}`
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+	defer func() { _ = os.Unsetenv("OC_GO_CC_CONFIG") }()
+
+	oldAPIKey := os.Getenv("OC_GO_CC_API_KEY")
+	_ = os.Unsetenv("OC_GO_CC_API_KEY")
+	defer func() { _ = os.Setenv("OC_GO_CC_API_KEY", oldAPIKey) }()
+	oldAPIKeys := os.Getenv("OC_GO_CC_API_KEYS")
+	_ = os.Unsetenv("OC_GO_CC_API_KEYS")
+	defer func() { _ = os.Setenv("OC_GO_CC_API_KEYS", oldAPIKeys) }()
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() expected error when both api_key and api_keys are missing, got nil")
+	}
+}
+
 func TestExpandHome(t *testing.T) {
 	home, _ := os.UserHomeDir()
 

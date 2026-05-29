@@ -84,7 +84,8 @@ Environment variables override config file values. Config values also support `$
 
 | Variable                | Description                                 | Default                                          |
 | ----------------------- | ------------------------------------------- | ------------------------------------------------ |
-| `OC_GO_CC_API_KEY`      | OpenCode Go API key (**required**)          | —                                                |
+| `OC_GO_CC_API_KEY`      | OpenCode Go API key (**required** unless `OC_GO_CC_API_KEYS` is set) | —                                                |
+| `OC_GO_CC_API_KEYS`     | Comma-separated list of API keys for rotation (overrides `OC_GO_CC_API_KEY`) | —                                                |
 | `OC_GO_CC_CONFIG`       | Custom config file path                     | `~/.config/oc-go-cc/config.json`                 |
 | `OC_GO_CC_HOST`         | Proxy listen host                           | `127.0.0.1`                                      |
 | `OC_GO_CC_PORT`         | Proxy listen port                           | `3456`                                           |

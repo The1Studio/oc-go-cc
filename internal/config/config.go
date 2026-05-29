@@ -6,6 +6,7 @@ import "encoding/json"
 // Config holds the complete application configuration.
 type Config struct {
 	APIKey                         string                   `json:"api_key"`
+	APIKeys                        []string                 `json:"api_keys,omitempty"`
 	Host                           string                   `json:"host"`
 	Port                           int                      `json:"port"`
 	HotReload                      bool                     `json:"hot_reload"`
