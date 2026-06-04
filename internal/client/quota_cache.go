@@ -16,8 +16,8 @@ type QuotaCache struct {
 }
 
 type quotaCacheEntry struct {
-	data      []byte
-	cachedAt  time.Time
+	data     []byte
+	cachedAt time.Time
 }
 
 func NewQuotaCache() *QuotaCache {
