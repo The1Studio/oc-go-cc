@@ -59,7 +59,7 @@ func NewServer(atomic *config.AtomicConfig) (*Server, error) {
 		tokenCounter,
 		metrics,
 	)
-	healthHandler := handlers.NewHealthHandler(tokenCounter, fallbackHandler, metrics)
+	healthHandler := handlers.NewHealthHandler(tokenCounter, fallbackHandler, metrics, openCodeClient)
 
 	// Setup router.
 	mux := http.NewServeMux()

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"oc-go-cc/internal/client"
 	"oc-go-cc/internal/metrics"
 	"oc-go-cc/internal/router"
 	"oc-go-cc/internal/token"
@@ -15,14 +16,16 @@ type HealthHandler struct {
 	tokenCounter    *token.Counter
 	fallbackHandler *router.FallbackHandler
 	metrics         *metrics.Metrics
+	openCodeClient  *client.OpenCodeClient
 }
 
 // NewHealthHandler creates a new health handler.
-func NewHealthHandler(tokenCounter *token.Counter, fallbackHandler *router.FallbackHandler, metrics *metrics.Metrics) *HealthHandler {
+func NewHealthHandler(tokenCounter *token.Counter, fallbackHandler *router.FallbackHandler, metrics *metrics.Metrics, openCodeClient *client.OpenCodeClient) *HealthHandler {
 	return &HealthHandler{
 		tokenCounter:    tokenCounter,
 		fallbackHandler: fallbackHandler,
 		metrics:         metrics,
+		openCodeClient:  openCodeClient,
 	}
 }
 
@@ -53,6 +56,10 @@ func (h *HealthHandler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 		},
 		"circuit_breakers": cbStates,
 		"models":           snapshot.ModelCounts,
+	}
+
+	if h.openCodeClient != nil {
+		response["keys"] = h.openCodeClient.HealthSnapshot()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
