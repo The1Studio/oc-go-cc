@@ -80,6 +80,26 @@ func countTokensForTest(t *testing.T, handler *HealthHandler, body []byte) int {
 	return response["input_tokens"]
 }
 
+func TestHandleHealthOmitsKeysWhenClientNil(t *testing.T) {
+	handler := newTestHealthHandler(t)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	handler.HandleHealth(recorder, req)
+
+	if got, want := recorder.Code, http.StatusOK; got != want {
+		t.Fatalf("status = %d, want %d", got, want)
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if _, ok := body["keys"]; ok {
+		t.Fatal("expected keys field to be absent when client is nil")
+	}
+}
+
 func newTestHealthHandler(t *testing.T) *HealthHandler {
 	t.Helper()
 
@@ -87,5 +107,5 @@ func newTestHealthHandler(t *testing.T) *HealthHandler {
 	if err != nil {
 		t.Fatalf("NewCounter() error = %v", err)
 	}
-	return NewHealthHandler(counter, nil, metrics.New())
+	return NewHealthHandler(counter, nil, metrics.New(), nil)
 }

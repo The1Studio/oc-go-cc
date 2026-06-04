@@ -368,3 +368,75 @@ func (c *OpenCodeClient) SendAnthropicRequest(
 	}
 	return nil, lastErr
 }
+
+// KeyHealth reports the runtime state of a single API key.
+type KeyHealth struct {
+	Index         int        `json:"index"`
+	KeyPreview    string     `json:"key_preview"`   // last 4 chars, masked for security
+	CircuitState  string     `json:"circuit_state"` // closed, half_open, open
+	IsCold        bool       `json:"is_cold"`
+	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
+}
+
+// HealthSnapshot returns a point-in-time view of every configured key's health.
+// Safe to call concurrently; takes snapshots of internal state without blocking
+// the hot path for long.
+func (c *OpenCodeClient) HealthSnapshot() []KeyHealth {
+	keys := c.configuredKeys()
+	if len(keys) == 0 {
+		return nil
+	}
+
+	c.keyMu.Lock()
+	cooldownCopy := make(map[string]time.Time, len(c.keyCooldown))
+	for k, v := range c.keyCooldown {
+		cooldownCopy[k] = v
+	}
+	c.keyMu.Unlock()
+
+	c.cbMu.Lock()
+	cbCopy := make(map[string]*KeyCircuitBreaker, len(c.keyCB))
+	for k, v := range c.keyCB {
+		cbCopy[k] = v
+	}
+	c.cbMu.Unlock()
+
+	now := time.Now()
+	result := make([]KeyHealth, 0, len(keys))
+	for i, key := range keys {
+		h := KeyHealth{Index: i}
+
+		// Mask key: show only last 4 chars.
+		if len(key) > 4 {
+			h.KeyPreview = "..." + key[len(key)-4:]
+		} else {
+			h.KeyPreview = "****"
+		}
+
+		// Circuit breaker state.
+		if cb, ok := cbCopy[key]; ok {
+			switch cb.State() {
+			case CircuitClosed:
+				h.CircuitState = "closed"
+			case CircuitHalfOpen:
+				h.CircuitState = "half_open"
+			case CircuitOpen:
+				h.CircuitState = "open"
+			default:
+				h.CircuitState = "unknown"
+			}
+		} else {
+			h.CircuitState = "closed"
+		}
+
+		// Cooldown status.
+		if until, ok := cooldownCopy[key]; ok && now.Before(until) {
+			h.IsCold = true
+			utc := until.UTC()
+			h.CooldownUntil = &utc
+		}
+
+		result = append(result, h)
+	}
+	return result
+}
