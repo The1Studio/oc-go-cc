@@ -1,8 +1,11 @@
 package handlers
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"oc-go-cc/internal/client"
 	"oc-go-cc/internal/metrics"
@@ -17,6 +20,7 @@ type HealthHandler struct {
 	fallbackHandler *router.FallbackHandler
 	metrics         *metrics.Metrics
 	openCodeClient  *client.OpenCodeClient
+	tokenCountCache *client.ResponseCache
 }
 
 // NewHealthHandler creates a new health handler.
@@ -26,6 +30,7 @@ func NewHealthHandler(tokenCounter *token.Counter, fallbackHandler *router.Fallb
 		fallbackHandler: fallbackHandler,
 		metrics:         metrics,
 		openCodeClient:  openCodeClient,
+		tokenCountCache: client.NewResponseCache(5 * time.Minute),
 	}
 }
 
@@ -106,6 +111,11 @@ func (h *HealthHandler) HandleQuota(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+func hashBytes(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
 // HandleCountTokens handles POST /v1/messages/count_tokens.
 func (h *HealthHandler) HandleCountTokens(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -117,6 +127,18 @@ func (h *HealthHandler) HandleCountTokens(w http.ResponseWriter, r *http.Request
 
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	// Cache key: SHA256 of the raw JSON body. Token counts are deterministic
+	// for the same message content, so caching avoids redundant tiktoken work.
+	bodyBytes, _ := json.Marshal(body)
+	cacheKey := hashBytes(bodyBytes)
+	if cached, ok := h.tokenCountCache.Get(cacheKey); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Cache", "hit")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(cached)
 		return
 	}
 
@@ -133,10 +155,15 @@ func (h *HealthHandler) HandleCountTokens(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]int{
+	resp := map[string]int{
 		"input_tokens": count,
 		"token_count":  count,
-	})
+	}
+	respBytes, _ := json.Marshal(resp)
+	h.tokenCountCache.Set(cacheKey, respBytes)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Cache", "miss")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(respBytes)
 }

@@ -37,6 +37,43 @@ func TestHandleCountTokensSupportsAnthropicContentBlocks(t *testing.T) {
 	if got, want := response["token_count"], response["input_tokens"]; got != want {
 		t.Fatalf("token_count = %d, want %d", got, want)
 	}
+	if recorder.Header().Get("X-Cache") != "miss" {
+		t.Fatalf("expected X-Cache=miss on first call, got %q", recorder.Header().Get("X-Cache"))
+	}
+}
+
+func TestHandleCountTokensCachesResult(t *testing.T) {
+	handler := newTestHealthHandler(t)
+
+	body := []byte(`{
+		"model":"deepseek-v4-pro",
+		"messages":[{"role":"user","content":[{"type":"text","text":"cache me"}]}]
+	}`)
+
+	// First call — cache miss.
+	rec1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", bytes.NewReader(body))
+	handler.HandleCountTokens(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first call status = %d, want 200", rec1.Code)
+	}
+	if rec1.Header().Get("X-Cache") != "miss" {
+		t.Fatalf("expected X-Cache=miss, got %q", rec1.Header().Get("X-Cache"))
+	}
+
+	// Second call with identical body — cache hit.
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", bytes.NewReader(body))
+	handler.HandleCountTokens(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second call status = %d, want 200", rec2.Code)
+	}
+	if rec2.Header().Get("X-Cache") != "hit" {
+		t.Fatalf("expected X-Cache=hit, got %q", rec2.Header().Get("X-Cache"))
+	}
+	if rec2.Body.String() != rec1.Body.String() {
+		t.Fatalf("cached body mismatch: %q vs %q", rec2.Body.String(), rec1.Body.String())
+	}
 }
 
 func TestHandleCountTokensIncludesSystemToolsAndThinking(t *testing.T) {
@@ -88,7 +125,7 @@ func TestHandleHealthOmitsKeysWhenClientNil(t *testing.T) {
 	handler.HandleHealth(recorder, req)
 
 	if got, want := recorder.Code, http.StatusOK; got != want {
-		t.Fatalf("status = %d, want %d", got, want)
+		t.Fatalf("status = %d, want %d; body: %s", got, want, recorder.Body.String())
 	}
 
 	var body map[string]interface{}
@@ -108,7 +145,7 @@ func TestHandleQuotaOmitsKeysWhenClientNil(t *testing.T) {
 	handler.HandleQuota(recorder, req)
 
 	if got, want := recorder.Code, http.StatusOK; got != want {
-		t.Fatalf("status = %d, want %d", got, want)
+		t.Fatalf("status = %d, want %d; body: %s", got, want, recorder.Body.String())
 	}
 
 	var body map[string]interface{}
@@ -120,6 +157,33 @@ func TestHandleQuotaOmitsKeysWhenClientNil(t *testing.T) {
 	}
 	if body["service"] != "oc-go-cc" {
 		t.Fatalf("service = %q, want oc-go-cc", body["service"])
+	}
+}
+
+func TestHandleQuotaCachesTokenCountResults(t *testing.T) {
+	handler := newTestHealthHandler(t)
+
+	reqBody := []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hello"}]}`)
+
+	// Warm cache via count_tokens.
+	rec1 := httptest.NewRecorder()
+	handler.HandleCountTokens(rec1, httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", bytes.NewReader(reqBody)))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("warm status = %d, want 200", rec1.Code)
+	}
+
+	// Same body again — should hit cache.
+	rec2 := httptest.NewRecorder()
+	handler.HandleCountTokens(rec2, httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", bytes.NewReader(reqBody)))
+	if rec2.Header().Get("X-Cache") != "hit" {
+		t.Fatalf("expected cache hit, got %q", rec2.Header().Get("X-Cache"))
+	}
+
+	// Quota endpoint itself should still be dynamic.
+	rec3 := httptest.NewRecorder()
+	handler.HandleQuota(rec3, httptest.NewRequest(http.MethodGet, "/quota", nil))
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("quota status = %d, want 200", rec3.Code)
 	}
 }
 
