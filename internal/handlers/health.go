@@ -68,6 +68,44 @@ func (h *HealthHandler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+// HandleQuota handles GET /quota.
+// Returns per-key request metrics (quota proxy) + health status.
+func (h *HealthHandler) HandleQuota(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	snapshot := h.metrics.GetSnapshot()
+	cbStates := map[string]string{}
+	if h.fallbackHandler != nil {
+		cbStates = h.fallbackHandler.GetCircuitStates()
+	}
+
+	response := map[string]interface{}{
+		"service":          "oc-go-cc",
+		"status":           "ok",
+		"circuit_breakers": cbStates,
+		"models":           snapshot.ModelCounts,
+		"metrics": map[string]interface{}{
+			"requests_received": snapshot.RequestsReceived,
+			"requests_success":  snapshot.RequestsSuccess,
+			"requests_failed":   snapshot.RequestsFailed,
+			"upstream_calls":    snapshot.UpstreamCalls,
+			"rate_limited":      snapshot.RateLimited,
+		},
+	}
+
+	if h.openCodeClient != nil {
+		response["keys"] = h.openCodeClient.KeyMetricsSnapshot()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(response)
+}
+
 // HandleCountTokens handles POST /v1/messages/count_tokens.
 func (h *HealthHandler) HandleCountTokens(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
