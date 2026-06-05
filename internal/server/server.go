@@ -25,6 +25,7 @@ type Server struct {
 	httpSrv  *http.Server
 	logger   *slog.Logger
 	levelVar *slog.LevelVar
+	tracker  *InFlightTracker
 }
 
 // NewServer creates a new proxy server.
@@ -70,11 +71,14 @@ func NewServer(atomic *config.AtomicConfig) (*Server, error) {
 	mux.HandleFunc("/health", healthHandler.HandleHealth)
 	mux.HandleFunc("/quota", healthHandler.HandleQuota)
 
+	// In-flight request tracking for graceful shutdown.
+	tracker := NewInFlightTracker()
+
 	// Create HTTP server.
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	httpSrv := &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      tracker.Track(mux),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 5 * time.Minute,
 		IdleTimeout:  120 * time.Second,
@@ -85,6 +89,7 @@ func NewServer(atomic *config.AtomicConfig) (*Server, error) {
 		httpSrv:  httpSrv,
 		logger:   logger,
 		levelVar: levelVar,
+		tracker:  tracker,
 	}
 
 	// Register callback to update log level on config reload
@@ -105,15 +110,36 @@ func (s *Server) Start() error {
 		"base_url", cfg.OpenCodeGo.BaseURL,
 	)
 
+	// In-flight tracker is created in NewServer and wired into the handler chain.
+	// We access it via the server struct field added below.
 	// Graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
 		<-ctx.Done()
-		s.logger.Info("shutting down server...")
+		s.logger.Info("shutting down server...", "in_flight", s.tracker.Count())
 
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// Wait for in-flight requests to drain (up to 15s) before closing listeners.
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer drainCancel()
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+	waitLoop:
+		for {
+			select {
+			case <-drainCtx.Done():
+				s.logger.Warn("drain timeout exceeded, forcing shutdown", "in_flight", s.tracker.Count())
+				break waitLoop
+			case <-ticker.C:
+				if s.tracker.Count() == 0 {
+					s.logger.Info("all requests drained")
+					break waitLoop
+				}
+			}
+		}
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
 		if err := s.httpSrv.Shutdown(shutdownCtx); err != nil {

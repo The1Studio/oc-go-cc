@@ -33,8 +33,12 @@ type MessagesHandler struct {
 	logger              *slog.Logger
 	rateLimiter         *middleware.RateLimiter
 	requestDedup        *middleware.RequestDeduplicator
+	requestCoalescer    *middleware.RequestCoalescer
 	requestIDGen        *middleware.RequestIDGenerator
 	metrics             *metrics.Metrics
+	// upstreamCache caches non-streaming upstream responses (TTL 30s) to
+	// avoid duplicate upstream calls for identical requests.
+	upstreamCache *client.ResponseCache
 }
 
 // responseWriter wraps http.ResponseWriter to track if headers were written.
@@ -64,6 +68,28 @@ func (w *responseWriter) Flush() {
 	}
 }
 
+// responseRecorder captures writes so they can be replayed to coalesced waiters.
+type responseRecorder struct {
+	header      http.Header
+	statusCode  int
+	body        []byte
+	wroteHeader bool
+}
+
+func newResponseRecorder() *responseRecorder {
+	return &responseRecorder{header: make(http.Header)}
+}
+
+func (rec *responseRecorder) Header() http.Header  { return rec.header }
+func (rec *responseRecorder) WriteHeader(code int) { rec.statusCode = code; rec.wroteHeader = true }
+func (rec *responseRecorder) Write(b []byte) (int, error) {
+	if !rec.wroteHeader {
+		rec.WriteHeader(http.StatusOK)
+	}
+	rec.body = append(rec.body, b...)
+	return len(b), nil
+}
+
 // NewMessagesHandler creates a new messages handler.
 func NewMessagesHandler(
 	openCodeClient *client.OpenCodeClient,
@@ -83,8 +109,10 @@ func NewMessagesHandler(
 		logger:              slog.Default(),
 		rateLimiter:         middleware.NewRateLimiter(100, time.Minute),
 		requestDedup:        middleware.NewRequestDeduplicator(500 * time.Millisecond),
+		requestCoalescer:    middleware.NewRequestCoalescer(30 * time.Second),
 		requestIDGen:        middleware.NewRequestIDGenerator(),
 		metrics:             metrics,
+		upstreamCache:       client.NewResponseCache(30 * time.Second),
 	}
 }
 
@@ -118,18 +146,23 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Deduplicate - skip duplicate requests
-	if _, ok := h.requestDedup.TryAcquire(rawBody); !ok {
-		h.metrics.RecordDeduplicated()
-		h.logger.Info("duplicate request skipped", "request_id", requestID)
-		return
-	}
-
-	// Parse into Anthropic request
+	// Parse into Anthropic request (needed before routing + coalescing decision)
 	var anthropicReq types.MessageRequest
 	if err := json.Unmarshal(rawBody, &anthropicReq); err != nil {
 		h.sendError(w, http.StatusBadRequest, "invalid request body", err)
 		return
+	}
+
+	isStreaming := anthropicReq.Stream != nil && *anthropicReq.Stream
+
+	// Streaming: use simple dedup (skip duplicate within 500ms window).
+	// Coalescing a stream is too complex — we just drop duplicates.
+	if isStreaming {
+		if _, ok := h.requestDedup.TryAcquire(rawBody); !ok {
+			h.metrics.RecordDeduplicated()
+			h.logger.Info("duplicate streaming request skipped", "request_id", requestID)
+			return
+		}
 	}
 
 	// Validate request
@@ -139,7 +172,6 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Record metrics
-	isStreaming := anthropicReq.Stream != nil && *anthropicReq.Stream
 	h.metrics.RecordRequest(isStreaming)
 
 	h.logger.Info("received request",
@@ -204,8 +236,27 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 		// Streaming: use ProxyStream for real-time SSE transformation
 		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody)
 	} else {
-		// Non-streaming: execute with fallback and return full response
-		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody)
+		// Non-streaming: attempt coalescing.
+		// If an identical request is already in-flight, wait for it and replay.
+		ifr, isFirst := h.requestCoalescer.Start(rawBody)
+		if !isFirst {
+			h.metrics.RecordDeduplicated()
+			h.logger.Info("coalescing non-streaming request", "request_id", requestID)
+			ifr.Wait(w)
+			return
+		}
+
+		// Record the response so waiters can replay it.
+		rec := newResponseRecorder()
+		h.handleNonStreaming(rec, r, &anthropicReq, modelChain, rawBody)
+		h.requestCoalescer.Finish(rawBody, rec.body, rec.statusCode, nil)
+
+		// Write recorded response to the real ResponseWriter.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(rec.statusCode)
+		if len(rec.body) > 0 {
+			_, _ = w.Write(rec.body)
+		}
 	}
 }
 
