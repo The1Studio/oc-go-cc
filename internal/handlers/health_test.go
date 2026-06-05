@@ -100,6 +100,29 @@ func TestHandleHealthOmitsKeysWhenClientNil(t *testing.T) {
 	}
 }
 
+func TestHandleQuotaOmitsKeysWhenClientNil(t *testing.T) {
+	handler := newTestHealthHandler(t)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/quota", nil)
+	handler.HandleQuota(recorder, req)
+
+	if got, want := recorder.Code, http.StatusOK; got != want {
+		t.Fatalf("status = %d, want %d", got, want)
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if _, ok := body["keys"]; ok {
+		t.Fatal("expected keys field to be absent when client is nil")
+	}
+	if body["service"] != "oc-go-cc" {
+		t.Fatalf("service = %q, want oc-go-cc", body["service"])
+	}
+}
+
 func newTestHealthHandler(t *testing.T) *HealthHandler {
 	t.Helper()
 

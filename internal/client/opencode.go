@@ -22,6 +22,34 @@ import (
 // within the minute.
 const defaultKeyCooldownDuration = 60 * time.Second
 
+// keyMetricsInternal holds mutable counters for a single API key.
+// Hot-path updates use atomic ops; reads take the mutex.
+type keyMetricsInternal struct {
+	requestsTotal   atomic.Int64
+	requestsSuccess atomic.Int64
+	requestsFailed  atomic.Int64
+	totalLatencyMs  atomic.Int64
+	mu              sync.RWMutex
+	lastError       string
+	lastUsedAt      time.Time
+}
+
+func (m *keyMetricsInternal) record(success bool, latencyMs int64, err string) {
+	m.requestsTotal.Add(1)
+	m.totalLatencyMs.Add(latencyMs)
+	if success {
+		m.requestsSuccess.Add(1)
+	} else {
+		m.requestsFailed.Add(1)
+	}
+	m.mu.Lock()
+	m.lastUsedAt = time.Now()
+	if !success && err != "" {
+		m.lastError = err
+	}
+	m.mu.Unlock()
+}
+
 // OpenCodeClient handles communication with OpenCode Go API.
 type OpenCodeClient struct {
 	atomic     *config.AtomicConfig
@@ -39,6 +67,10 @@ type OpenCodeClient struct {
 	// Mirrors router.CircuitBreaker but scoped to individual API keys.
 	cbMu  sync.Mutex
 	keyCB map[string]*KeyCircuitBreaker
+
+	// keyMetrics tracks per-key request stats (quota proxy + latency).
+	metricsMu  sync.RWMutex
+	keyMetrics map[string]*keyMetricsInternal
 }
 
 // NewOpenCodeClient creates a new OpenCode Go client.
@@ -66,6 +98,7 @@ func NewOpenCodeClient(atomic *config.AtomicConfig) *OpenCodeClient {
 		},
 		keyCooldown: make(map[string]time.Time),
 		keyCB:       make(map[string]*KeyCircuitBreaker),
+		keyMetrics:  make(map[string]*keyMetricsInternal),
 	}
 }
 
@@ -93,6 +126,18 @@ func (c *OpenCodeClient) getKeyCircuitBreaker(key string) *KeyCircuitBreaker {
 		c.keyCB[key] = cb
 	}
 	return cb
+}
+
+// getKeyMetrics returns or creates the metrics struct for the given key.
+func (c *OpenCodeClient) getKeyMetrics(key string) *keyMetricsInternal {
+	c.metricsMu.Lock()
+	defer c.metricsMu.Unlock()
+	m, ok := c.keyMetrics[key]
+	if !ok {
+		m = &keyMetricsInternal{}
+		c.keyMetrics[key] = m
+	}
+	return m
 }
 
 // isRetryableStatus returns true for HTTP codes worth retrying with another key.
@@ -246,8 +291,11 @@ func (c *OpenCodeClient) doRequest(
 	streaming bool,
 	anthropicHeaders bool,
 ) (*http.Response, int, error) {
+	start := time.Now()
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL, bytes.NewReader(body))
 	if err != nil {
+		latencyMs := time.Since(start).Milliseconds()
+		c.getKeyMetrics(apiKey).record(false, latencyMs, err.Error())
 		return nil, 0, fmt.Errorf("failed to create request: %w", err)
 	}
 
@@ -262,7 +310,9 @@ func (c *OpenCodeClient) doRequest(
 	}
 
 	resp, err := c.httpClient.Do(httpReq)
+	latencyMs := time.Since(start).Milliseconds()
 	if err != nil {
+		c.getKeyMetrics(apiKey).record(false, latencyMs, err.Error())
 		return nil, 0, fmt.Errorf("request failed: %w", err)
 	}
 
@@ -273,13 +323,16 @@ func (c *OpenCodeClient) doRequest(
 		// Structured error so the fallback loop + handler can propagate
 		// quota-exhaustion (429 + Retry-After) instead of flattening it
 		// into a generic 502. See pkg/types.UpstreamError.
-		return nil, resp.StatusCode, &types.UpstreamError{
+		ue := &types.UpstreamError{
 			StatusCode: resp.StatusCode,
 			RetryAfter: retryAfter,
 			Body:       string(bodyBytes),
 		}
+		c.getKeyMetrics(apiKey).record(false, latencyMs, ue.Error())
+		return nil, resp.StatusCode, ue
 	}
 
+	c.getKeyMetrics(apiKey).record(true, latencyMs, "")
 	return resp, resp.StatusCode, nil
 }
 
@@ -448,6 +501,66 @@ func (c *OpenCodeClient) HealthSnapshot() []KeyHealth {
 		}
 
 		result = append(result, h)
+	}
+	return result
+}
+
+// KeyMetricsSnapshot reports per-key request statistics for quota/usage visibility.
+type KeyMetricsSnapshot struct {
+	Index           int        `json:"index"`
+	KeyPreview      string     `json:"key_preview"`
+	RequestsTotal   int64      `json:"requests_total"`
+	RequestsSuccess int64      `json:"requests_success"`
+	RequestsFailed  int64      `json:"requests_failed"`
+	AvgLatencyMs    int64      `json:"avg_latency_ms"`
+	TotalLatencyMs  int64      `json:"total_latency_ms"`
+	LastError       string     `json:"last_error,omitempty"`
+	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
+}
+
+// KeyMetricsSnapshot returns a point-in-time view of every configured key's
+// request metrics (quota proxy + latency). Safe to call concurrently.
+func (c *OpenCodeClient) KeyMetricsSnapshot() []KeyMetricsSnapshot {
+	keys := c.configuredKeys()
+	if len(keys) == 0 {
+		return nil
+	}
+
+	c.metricsMu.RLock()
+	metricsCopy := make(map[string]*keyMetricsInternal, len(c.keyMetrics))
+	for k, v := range c.keyMetrics {
+		metricsCopy[k] = v
+	}
+	c.metricsMu.RUnlock()
+
+	result := make([]KeyMetricsSnapshot, 0, len(keys))
+	for i, key := range keys {
+		s := KeyMetricsSnapshot{Index: i}
+
+		if len(key) > 4 {
+			s.KeyPreview = "..." + key[len(key)-4:]
+		} else {
+			s.KeyPreview = "****"
+		}
+
+		if m, ok := metricsCopy[key]; ok {
+			s.RequestsTotal = m.requestsTotal.Load()
+			s.RequestsSuccess = m.requestsSuccess.Load()
+			s.RequestsFailed = m.requestsFailed.Load()
+			s.TotalLatencyMs = m.totalLatencyMs.Load()
+			if s.RequestsTotal > 0 {
+				s.AvgLatencyMs = s.TotalLatencyMs / s.RequestsTotal
+			}
+			m.mu.RLock()
+			s.LastError = m.lastError
+			if !m.lastUsedAt.IsZero() {
+				utc := m.lastUsedAt.UTC()
+				s.LastUsedAt = &utc
+			}
+			m.mu.RUnlock()
+		}
+
+		result = append(result, s)
 	}
 	return result
 }
