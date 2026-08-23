@@ -784,6 +784,133 @@ func TestProxyStream_MixedTextAndToolCall(t *testing.T) {
 	}
 }
 
+// unterminatedReader simulates an upstream body that stops mid-stream: it
+// yields data once, then always returns err (never io.EOF, unless err is
+// io.EOF itself). This is the shape of a real OpenCode Go / OpenCode Zen
+// disconnect where the TCP connection drops without a clean chunked
+// terminator — Go's http.Client surfaces that as io.ErrUnexpectedEOF, not
+// io.EOF.
+type unterminatedReader struct {
+	data []byte
+	err  error
+	sent bool
+}
+
+func (r *unterminatedReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		n := copy(p, r.data)
+		return n, nil
+	}
+	return 0, r.err
+}
+
+func (r *unterminatedReader) Close() error { return nil }
+
+// TestProxyStream_UpstreamReadError_StillTerminatesStream is the regression
+// test for theonekit-model-router#325: a stream that ends via a non-EOF read
+// error (io.ErrUnexpectedEOF) must still close open content blocks and emit
+// message_delta + message_stop, not abandon the client mid-stream.
+//
+// Before the fix, ProxyStream's `if err != nil` branch (the io.EOF check's
+// sibling) returned immediately with a wrapped error, skipping both the
+// tool/content block cleanup AND message_stop entirely — the exact
+// "content_block_stop (or mid-content_block_delta) without message_delta or
+// message_stop" signature from the issue.
+func TestProxyStream_UpstreamReadError_StillTerminatesStream(t *testing.T) {
+	handler := NewStreamHandler()
+	w := newMockResponseWriter()
+	body := &unterminatedReader{
+		data: []byte(`data: {"choices":[{"delta":{"content":"Hello"}}]}` + "\n\n"),
+		err:  io.ErrUnexpectedEOF,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := handler.ProxyStream(w, body, "deepseek-v4-flash", ctx); err != nil {
+		t.Fatalf("ProxyStream error: %v, want nil (stream should terminate gracefully)", err)
+	}
+
+	events := parseSSEEvents(t, w.buf.String())
+	if len(events) == 0 {
+		t.Fatalf("no events emitted")
+	}
+
+	last := events[len(events)-1]
+	if last.Type != "message_stop" {
+		t.Fatalf("last event = %q, want message_stop (got %+v)", last.Type, events)
+	}
+
+	var sawContentBlockStop, sawMessageDelta bool
+	for _, ev := range events {
+		if ev.Type == "content_block_stop" {
+			sawContentBlockStop = true
+		}
+		if ev.Type == "message_delta" {
+			sawMessageDelta = true
+			if ev.Delta == nil || ev.Delta.StopReason == "" {
+				t.Errorf("message_delta missing stop_reason: %+v", ev)
+			}
+		}
+	}
+	if !sawContentBlockStop {
+		t.Errorf("no content_block_stop emitted for the open text block: %+v", events)
+	}
+	if !sawMessageDelta {
+		t.Errorf("no message_delta emitted before message_stop: %+v", events)
+	}
+}
+
+// TestProxyStream_EOFWithoutFinishReason_StillTerminatesStream covers the
+// same #325 signature via the more common path: a clean EOF (upstream
+// closed the connection) that never carried a finish_reason chunk at all.
+// Before the fix, the post-loop cleanup only closed open tool_use blocks and
+// sent message_stop — it never closed an open text/thinking block and never
+// sent message_delta, so the client received a stream that looked complete
+// but was reported with stop_reason: null and zero output tokens.
+func TestProxyStream_EOFWithoutFinishReason_StillTerminatesStream(t *testing.T) {
+	handler := NewStreamHandler()
+	w := newMockResponseWriter()
+	// Upstream sends content and then just closes — no finish_reason chunk.
+	body := sseLines(
+		`{"choices":[{"delta":{"content":"Hello"}}]}`,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx); err != nil {
+		t.Fatalf("ProxyStream error: %v", err)
+	}
+
+	events := parseSSEEvents(t, w.buf.String())
+
+	last := events[len(events)-1]
+	if last.Type != "message_stop" {
+		t.Fatalf("last event = %q, want message_stop (got %+v)", last.Type, events)
+	}
+
+	var sawContentBlockStop, sawMessageDelta bool
+	for _, ev := range events {
+		if ev.Type == "content_block_stop" {
+			sawContentBlockStop = true
+		}
+		if ev.Type == "message_delta" {
+			sawMessageDelta = true
+			if ev.Delta == nil || ev.Delta.StopReason == "" {
+				t.Errorf("message_delta missing stop_reason: %+v", ev)
+			}
+		}
+	}
+	if !sawContentBlockStop {
+		t.Errorf("no content_block_stop emitted for the open text block: %+v", events)
+	}
+	if !sawMessageDelta {
+		t.Errorf("no message_delta emitted before message_stop: %+v", events)
+	}
+}
+
 // helpers
 
 func mustJSON(t *testing.T, v any) string {

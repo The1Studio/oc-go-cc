@@ -118,12 +118,60 @@ func (h *StreamHandler) ProxyStream(
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("failed to read stream: %w", err)
+			// The upstream connection ended abnormally — e.g. it closed
+			// without a clean chunked terminator, which Go's http.Client
+			// surfaces here as io.ErrUnexpectedEOF rather than io.EOF. We
+			// have already flushed message_start (and likely partial
+			// content) straight to the client, so returning an error here
+			// would leave those events unterminated: the caller cannot
+			// retry mid-stream without sending a second message_start into
+			// a response the client already believes is in progress.
+			// Terminate the stream we already started instead of abandoning
+			// it. See github.com/The1Studio/theonekit-model-router#325.
+			return h.emitTerminalEvents(w, flusher, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, startedToolCalls)
 		}
 	}
 
-	// Send stop events for any tool blocks not yet closed (e.g. upstream
-	// disconnected without sending a finish_reason chunk).
+	// The loop above exited via a clean EOF. If the upstream disconnected
+	// without ever sending a finish_reason chunk, no message_delta/
+	// message_stop has been emitted yet — close out the stream properly.
+	return h.emitTerminalEvents(w, flusher, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, startedToolCalls)
+}
+
+// emitTerminalEvents closes out an SSE stream that is ending abnormally —
+// via a clean EOF that never carried a finish_reason chunk, or via a read
+// error partway through the body. It closes any content block (text/
+// thinking) and any tool_use blocks still open, sends message_delta (with a
+// stop_reason) if one was never sent, and always sends message_stop.
+//
+// Without this, a stream cut short leaves the client holding a message that
+// looks complete — it received content_block_start/delta events — but was
+// never terminated: no message_delta (stop_reason, usage), no message_stop.
+// Some clients read that as a successful zero-token response instead of a
+// failure. See github.com/The1Studio/theonekit-model-router#325.
+func (h *StreamHandler) emitTerminalEvents(
+	w http.ResponseWriter,
+	flusher http.Flusher,
+	contentIndex *int,
+	contentStarted *bool,
+	reasoningStarted *bool,
+	stopSent *bool,
+	startedToolCalls map[int]int,
+) error {
+	// Close whatever text/thinking block was still open.
+	if *contentStarted || *reasoningStarted {
+		stopEvent := types.MessageEvent{
+			Type:  "content_block_stop",
+			Index: contentIndex,
+		}
+		if err := writeSSEEvent(w, stopEvent); err != nil {
+			return ErrClientDisconnected
+		}
+		*contentStarted = false
+		*reasoningStarted = false
+	}
+
+	// Close any tool_use blocks that never got a matching stop.
 	if len(startedToolCalls) > 0 {
 		type toolBlockEntry struct {
 			oi       int
@@ -146,6 +194,25 @@ func (h *StreamHandler) ProxyStream(
 				return ErrClientDisconnected
 			}
 		}
+		for oi := range startedToolCalls {
+			delete(startedToolCalls, oi)
+		}
+	}
+
+	// The upstream never sent (or we never finished parsing) a finish_reason
+	// chunk, so message_delta was never emitted. Send one now so the client
+	// gets a real stop_reason instead of reading the stream as unterminated.
+	if !*stopSent {
+		msgDelta := types.MessageEvent{
+			Type: "message_delta",
+			Delta: &types.Delta{
+				StopReason: "end_turn",
+			},
+		}
+		if err := writeSSEEvent(w, msgDelta); err != nil {
+			return ErrClientDisconnected
+		}
+		*stopSent = true
 	}
 
 	// Send message_stop event to signal stream completion.
@@ -269,6 +336,8 @@ func (h *StreamHandler) processSSELine(
 			if err := writeSSEEvent(w, stopEvent); err != nil {
 				return ErrClientDisconnected
 			}
+			*contentStarted = false
+			*reasoningStarted = false
 		}
 
 		// Close any open tool_use blocks in ascending index order
@@ -501,6 +570,8 @@ func (h *StreamHandler) processSSELine(
 			if err := writeSSEEvent(w, stopEvent); err != nil {
 				return ErrClientDisconnected
 			}
+			*contentStarted = false
+			*reasoningStarted = false
 		}
 
 		// Close any open tool_use blocks in ascending index order.
