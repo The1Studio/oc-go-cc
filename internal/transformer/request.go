@@ -288,12 +288,20 @@ func (t *RequestTransformer) transformAssistantMessage(blocks []types.ContentBlo
 	if reasoningContent != "" {
 		// Real thinking content from the upstream history — preserve it.
 		reasoningContentPtr = &reasoningContent
-	} else if hasThinkingInHistory && len(toolCalls) > 0 && isDeepSeekModel(modelID) {
+	} else if hasThinkingInHistory && isDeepSeekModel(modelID) {
 		// DeepSeek in thinking mode requires reasoning_content on ALL assistant
-		// messages, including tool-call turns where Claude Code didn't preserve
-		// the thinking block. Use a placeholder that won't trigger validation:
+		// messages, including turns where Claude Code didn't preserve the
+		// thinking block. Use a placeholder that won't trigger validation:
 		// DeepSeek checks for the field's presence, not its content, when the
 		// original thinking was stripped by the client.
+		//
+		// The scope is every assistant-message shape, NOT just tool-call turns.
+		// Thinking mode is enabled conversation-wide by HasThinkingBlocks, so it
+		// stays active for a later turn that carries neither thinking nor tool
+		// calls — Claude Code persists such a turn as plain text. Gating this on
+		// `len(toolCalls) > 0` left exactly that turn without reasoning_content
+		// and the request was rejected with:
+		//   The `reasoning_content` in the thinking mode must be passed back to the API.
 		placeholder := " "
 		reasoningContentPtr = &placeholder
 	} else if len(toolCalls) > 0 && needsPlaceholderReasoning(modelID) {
