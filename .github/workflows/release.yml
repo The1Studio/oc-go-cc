@@ -12,7 +12,7 @@ jobs:
   # ── Stage 1: Test & Build Validation ──────────────────────────────
   validate:
     name: Test & Build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, arc, the1studio, org]
     steps:
       - uses: actions/checkout@v4
 
@@ -36,7 +36,7 @@ jobs:
   release:
     name: Create Release
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, arc, the1studio, org]
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
@@ -222,7 +222,7 @@ jobs:
     name: Update Homebrew Tap
     needs: release
     if: github.repository == 'samueltuyizere/oc-go-cc'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, arc, the1studio, org]
     steps:
       - uses: actions/checkout@v4
 
@@ -350,7 +350,7 @@ jobs:
     name: Update Scoop Bucket
     needs: release
     if: github.repository == 'samueltuyizere/oc-go-cc'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, arc, the1studio, org]
     steps:
       - uses: actions/checkout@v4
 
